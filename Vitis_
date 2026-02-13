@@ -1,0 +1,138 @@
+#include "xil_io.h"
+#include "xil_printf.h"
+#include "xil_cache.h"
+#include "sleep.h"
+#include <stdint.h>
+
+// =========================================================
+// Address map (theo Address Editor của bạn)
+// =========================================================
+#define BRAM_PS_BASE        0x40000000u   // PS view của BRAM
+#define BRAM_SIZE_BYTES     0x8000u       // 32KB
+
+#define GPIO_RESET_BASE     0x41200000u   // axi_gpio_reset base
+
+// AXI GPIO (Channel 1) offsets
+#define GPIO_DATA_OFFSET    0x000u
+#define GPIO_TRI_OFFSET     0x004u        // 0=output, 1=input
+
+// =========================================================
+// RISC-V machine code bạn đưa (RV32)
+// sw sẽ ghi 0x12345678 -> địa chỉ 0x1000 (RISC-V view)
+// => PS view: BRAM_PS_BASE + 0x1000
+// =========================================================
+static const uint32_t riscv_code[] = {
+    0x00002117,
+    0x00010113,
+    0x008000EF,
+    0x0000006F,
+    0xFF010113,
+    0x00112623,
+    0x00812423,
+    0x01010413,
+    0x03802783,
+    0x12345737,
+    0x67870713,
+    0x00E7A023,
+    0x3A001073,
+    0x0000006F,
+    0x00001000
+};
+
+static void gpio_reset_init(void)
+{
+    // set GPIO channel 1 direction = output
+    Xil_Out32(GPIO_RESET_BASE + GPIO_TRI_OFFSET, 0x00000000u);
+
+    // vì cache bật, flush vùng thanh ghi cũng an toàn (không bắt buộc)
+    Xil_DCacheFlushRange(GPIO_RESET_BASE, 0x100);
+}
+
+// Bạn muốn API: 0=RESET, 1=RUN
+// Nhưng rst ACTIVE HIGH => drive bit phải đảo:
+//   state=0 (RESET) -> rst=1
+//   state=1 (RUN)   -> rst=0
+static void riscv_set_state_0reset_1run(int state_run)
+{
+    uint32_t rst_bit = (state_run ? 0u : 1u);
+    Xil_Out32(GPIO_RESET_BASE + GPIO_DATA_OFFSET, rst_bit);
+
+    Xil_DCacheFlushRange(GPIO_RESET_BASE, 0x100);
+
+    uint32_t tri  = Xil_In32(GPIO_RESET_BASE + GPIO_TRI_OFFSET);
+    uint32_t data = Xil_In32(GPIO_RESET_BASE + GPIO_DATA_OFFSET);
+    xil_printf("[GPIO] state=%d => rst_bit=%u | TRI=%08x DATA=%08x\r\n",
+               state_run, (unsigned)rst_bit, (unsigned)tri, (unsigned)data);
+}
+
+static void load_riscv_code_to_bram(void)
+{
+    xil_printf("--- RISC-V CODE LOADING (CACHE ON) ---\r\n");
+    xil_printf("Loading RISC-V code to BRAM (PS view @0x%08x)...\r\n", (unsigned)BRAM_PS_BASE);
+
+    for (unsigned i = 0; i < (sizeof(riscv_code)/sizeof(riscv_code[0])); i++) {
+        uint32_t addr = BRAM_PS_BASE + (i * 4u);
+        Xil_Out32(addr, riscv_code[i]);
+        xil_printf("(%08x): %08x\r\n", (unsigned)(i * 4u), (unsigned)riscv_code[i]);
+    }
+
+    // Cache ON: bắt buộc flush để RISC-V thấy code mới trong BRAM
+    Xil_DCacheFlushRange(BRAM_PS_BASE, BRAM_SIZE_BYTES);
+}
+
+int main(void)
+{
+    // BẬT cache lại
+    Xil_ICacheEnable();
+    Xil_DCacheEnable();
+
+    xil_printf("\r\n=== RISC-V SW VERIFY (CACHE ON) expect 0x12345678 -> BRAM[0x1000] ===\r\n");
+
+    gpio_reset_init();
+
+    // 1) Hold reset (0=RESET)
+    riscv_set_state_0reset_1run(0);
+
+    // 2) Load code vào BRAM
+    load_riscv_code_to_bram();
+
+    // 3) Sanity check: BRAM[0x38] phải là 0x00001000
+    Xil_DCacheInvalidateRange(BRAM_PS_BASE + 0x38u, 4);
+    uint32_t ptr_at_0x38 = Xil_In32(BRAM_PS_BASE + 0x38u);
+    xil_printf("Sanity: BRAM[0x0038] = %08x (expect 00001000)\r\n", (unsigned)ptr_at_0x38);
+
+    // 4) Pre-fill đích để thấy thay đổi chắc chắn
+    Xil_Out32(BRAM_PS_BASE + 0x1000u, 0xDEADBEEFu);
+    Xil_DCacheFlushRange(BRAM_PS_BASE + 0x1000u, 4);
+
+    Xil_DCacheInvalidateRange(BRAM_PS_BASE + 0x1000u, 4);
+    xil_printf("Pre-fill: BRAM[0x1000] = %08x\r\n", (unsigned)Xil_In32(BRAM_PS_BASE + 0x1000u));
+
+    // 5) Release run (1=RUN)
+    riscv_set_state_0reset_1run(1);
+    xil_printf("RISC-V released. Waiting for write...\r\n");
+
+    // 6) Poll đến khi thấy 0x12345678 xuất hiện tại 0x1000
+    const uint32_t EXPECT = 0x12345678u;
+    uint32_t v = 0;
+    int ok = 0;
+
+    for (int t = 0; t < 5000000; t++) {
+        // Cache ON: invalidate trước khi đọc kết quả do RISC-V ghi
+        Xil_DCacheInvalidateRange(BRAM_PS_BASE + 0x1000u, 4);
+        v = Xil_In32(BRAM_PS_BASE + 0x1000u);
+        if (v == EXPECT) { ok = 1; break; }
+    }
+
+    if (ok) {
+        xil_printf("PASS ✅  BRAM[0x1000] = %08x\r\n", (unsigned)v);
+        xil_printf("=> RISC-V fetched code @0x0, executed LW+SW, write data OK.\r\n");
+    } else {
+        xil_printf("FAIL ❌  Timeout. BRAM[0x1000] = %08x (expect %08x)\r\n",
+                   (unsigned)v, (unsigned)EXPECT);
+        xil_printf("Hint: reset/clock/mapping hoặc cache flush/invalidate chưa đúng.\r\n");
+    }
+
+    while (1) sleep(1);
+    return 0;
+}
